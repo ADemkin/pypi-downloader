@@ -8,7 +8,7 @@ import logging
 import re
 
 from aiohttp import ClientSession
-from aiohttp import ClientResponse
+from aiohttp import TCPConnector
 import aiofiles
 
 PYPI_SIMPLE = "https://pypi.python.org/simple"
@@ -19,6 +19,18 @@ logging.basicConfig(
     level=logging.DEBUG,
     format='%(levelname)s %(asctime)-10s: %(message)s',
 )
+
+
+def sd_package(name: str) -> str:
+    return f"[package name={name!r}]"
+
+
+def sd_uri(uri: str) -> str:
+    return f"[uri={uri!r}]"
+
+
+def sd_file(path: Path) -> str:
+    return f"[file path={str(path)!r}]"
 
 
 class Paths(NamedTuple):
@@ -66,19 +78,10 @@ def get_file_path_from_file_name(file_name: str, paths: Paths) -> Path:
         return paths.wheel / file_name
 
 
-def resp_not_ok(resp: ClientResponse, uri: str) -> bool:
-    if resp.status == 404:
-        logger.error(f"{uri!r} not found")
-        return True
-    if resp.status != 200:
-        logger.error(f"{uri!r} not OK: {resp!r}")
-        return True
-    return False
-
-
 async def get_package_names(session: ClientSession, paths: Paths) -> None:
     async with session.get(PYPI_SIMPLE) as resp:
-        if resp_not_ok(resp, PYPI_SIMPLE):
+        if resp.status != 200:
+            logger.error(sd_uri(PYPI_SIMPLE) + f" not ok: {resp.status}")
             return
         content = await resp.text()
     package_names: set[str] = set()
@@ -86,56 +89,60 @@ async def get_package_names(session: ClientSession, paths: Paths) -> None:
         _, name = match.groups()
         package_names.add(name)
     await asyncio.gather(*[
-        get_package_uris(session, paths, name)
+        get_package_uris(session, paths, name, sd_package(name))
         for name in package_names
     ])
+    logger.info("got all packages names")
 
 
 async def get_package_uris(
         session: ClientSession,
         paths: Paths,
         name: str,
+        sds: str,
 ) -> None:
+    logger.info(sds + " taken")
     package_uri = PYPI_JSON_TEMPALTE.format(package_name=name)
     async with session.get(package_uri) as resp:
-        if resp_not_ok(resp, package_uri):
+        if resp.status != 200:
+            logger.error(sds + sd_uri(package_uri) + f" not ok: {resp.status}")
             return
         package_data = await resp.json()
     uris: set[str] = set()
     try:
-        actual_uri = package_data['urls'][0]['url']
-        uris.add(actual_uri)
+        uris.add(package_data['urls'][0]['url'])
     except (KeyError, IndexError):
         pass
-    for releases in package_data['releases'].keys():
+    for releases in package_data['releases'].values():
         for release in releases:
-            try:
-                uri = release['url']
-                uris.add(uri)
-            except:
-                import pdb ; pdb.set_trace();
-                pass
+            uris.add(release['url'])
     await asyncio.gather(*[
-        download_uri(session, paths, uri)
+        download_uri(session, paths, uri, sds + sd_uri(uri))
         for uri in uris
     ])
+    logger.info(sds + " done")
 
 
 async def download_uri(
         session: ClientSession,
         paths: Paths,
         uri: str,
+        sds: str,
 ) -> None:
     file_name = get_file_name_from_uri(uri)
     file_path = get_file_path_from_file_name(file_name, paths)
+    sds += sd_file(file_path)
     if file_path.exists():
+        logger.info(sds + " already exists")
         return
     async with session.get(uri) as resp:
-        if resp_not_ok(resp, uri):
+        if resp.status != 200:
+            logger.error(sds + sd_uri(uri) + f" not ok: {resp.status}")
             return
         content_raw = await resp.read()
     async with aiofiles.open(file_path, "wb") as fd:
         await fd.write(content_raw)
+    logger.info(sds + " done")
 
 
 async def main(paths: Paths) -> None:
@@ -173,5 +180,3 @@ def prepare() -> None:
 
 if __name__ == '__main__':
     prepare()
-
-
