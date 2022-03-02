@@ -1,8 +1,8 @@
 from argparse import ArgumentParser
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from os import makedirs
 from pathlib import Path
+from typing import NamedTuple
 import asyncio
 import logging
 import re
@@ -21,24 +21,34 @@ logging.basicConfig(
 )
 
 
-@dataclass
-class Paths:
+class Paths(NamedTuple):
     base: Path
-    tarball: Path
-    wheel: Path
-    egg: Path
-    other: Path
+
+    @property
+    def tarball(self) -> Path:
+        return self.base / "tarball"
+
+    @property
+    def wheel(self) -> Path:
+        return self.base / "wheel"
+
+    @property
+    def egg(self) -> Path:
+        return self.base / "egg"
+
+    @property
+    def other(self) -> Path:
+        return self.base / "other"
+
+    def iter_paths(self) -> list[Path]:
+        return [self.tarball, self.wheel, self.egg, self.other]
 
 
 def prepare_paths(working_dir: Path) -> Paths:
-    base_path = Path(working_dir)
-    tarball_path = base_path / "tarball"
-    wheel_path = base_path / "wheel"
-    egg_path = base_path / "egg"
-    other_path = base_path / "other"
-    for path in (tarball_path, wheel_path, egg_path, other_path):
+    paths = Paths(Path(working_dir))
+    for path in paths.iter_paths():
         makedirs(path, exist_ok=True)
-    return Paths(base_path, tarball_path, wheel_path, egg_path, other_path)
+    return paths
 
 
 def get_file_name_from_uri(uri: str) -> str:
@@ -71,9 +81,14 @@ async def get_package_names(session: ClientSession, paths: Paths) -> None:
         if resp_not_ok(resp, PYPI_SIMPLE):
             return
         content = await resp.text()
+    package_names: set[str] = set()
     for match in re.finditer(r'\s+<a href="([^"]+)">([^<]+)</a>', content):
         _, name = match.groups()
-        await get_package_uris(session, paths, name)
+        package_names.add(name)
+    await asyncio.gather(*[
+        get_package_uris(session, paths, name)
+        for name in package_names
+    ])
 
 
 async def get_package_uris(
@@ -81,30 +96,39 @@ async def get_package_uris(
         paths: Paths,
         name: str,
 ) -> None:
-    logger.info(f"{name!r} package taken")
     package_uri = PYPI_JSON_TEMPALTE.format(package_name=name)
     async with session.get(package_uri) as resp:
         if resp_not_ok(resp, package_uri):
             return
         package_data = await resp.json()
+    uris: set[str] = set()
     try:
         actual_uri = package_data['urls'][0]['url']
-        await download_uri(session, paths, actual_uri)
+        uris.add(actual_uri)
     except (KeyError, IndexError):
         pass
-    for version, releases in package_data['releases'].items():
+    for releases in package_data['releases'].keys():
         for release in releases:
-            uri = release['url']
-            await download_uri(session, paths, uri)
-    logger.info(f"{name!r} package done")
+            try:
+                uri = release['url']
+                uris.add(uri)
+            except:
+                import pdb ; pdb.set_trace();
+                pass
+    await asyncio.gather(*[
+        download_uri(session, paths, uri)
+        for uri in uris
+    ])
 
 
-async def download_uri(session: ClientSession, paths: Paths, uri: str) -> None:
+async def download_uri(
+        session: ClientSession,
+        paths: Paths,
+        uri: str,
+) -> None:
     file_name = get_file_name_from_uri(uri)
-    logger.info(f"{file_name} taken")
     file_path = get_file_path_from_file_name(file_name, paths)
     if file_path.exists():
-        logger.debug(f"{file_name!r} already downladed")
         return
     async with session.get(uri) as resp:
         if resp_not_ok(resp, uri):
@@ -112,7 +136,6 @@ async def download_uri(session: ClientSession, paths: Paths, uri: str) -> None:
         content_raw = await resp.read()
     async with aiofiles.open(file_path, "wb") as fd:
         await fd.write(content_raw)
-    logger.info(f"{file_name!r} done")
 
 
 async def main(paths: Paths) -> None:
@@ -150,3 +173,5 @@ def prepare() -> None:
 
 if __name__ == '__main__':
     prepare()
+
+
