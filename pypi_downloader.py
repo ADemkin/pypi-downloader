@@ -4,14 +4,15 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from os import listdir
 from os import makedirs
+from os import rename
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import NamedTuple
 import asyncio
 import logging
 import re
 
-from aiofiles.os import rename as aiorename
-from aiofiles.tempfile import NamedTemporaryFile as aioNamedTemporaryFile
+from aiohttp import ClientError
 from aiohttp import ClientSession
 
 PYPI_SIMPLE = "https://pypi.python.org/simple"
@@ -27,7 +28,7 @@ logging.basicConfig(
 
 class Paths(NamedTuple):
     base: Path
-    known_paths: set[str] = set()
+    known_file_names: set[str] = set()
 
     @property
     def tarball(self) -> Path:
@@ -48,12 +49,12 @@ class Paths(NamedTuple):
     def iter_paths(self) -> list[Path]:
         return [self.tarball, self.wheel, self.egg, self.other]
 
-    def fill_known_paths(self) -> None:
+    def fill_known_file_names(self) -> None:
         for path in self.iter_paths():
-            self.known_paths.update(set(listdir(path)))
+            self.known_file_names.update(set(listdir(path)))
 
-    def add_path(self, path: str) -> None:
-        self.known_paths.add(path)
+    def add_file_name(self, path: str) -> None:
+        self.known_file_names.add(path)
 
     @classmethod
     def create(cls, working_dir: str) -> "Paths":
@@ -97,6 +98,7 @@ async def uris_fetcher(
         session: ClientSession,
         names_queue: Queue,
         uris_to_check_queue: Queue,
+        timeout: int = 60,
 ) -> None:
     while True:
         name = await names_queue.get()
@@ -110,7 +112,19 @@ async def uris_fetcher(
                     resp.status,
                 )
                 continue
-            package_data = await resp.json()
+            try:
+                package_data = await resp.json()
+            except asyncio.TimeoutError as err:
+                logger.error(
+                    "package: %r %s. Sleeping for %d seconds",
+                    package_uri,
+                    err,
+                    timeout,
+                )
+                await names_queue.put(name)
+                await asyncio.sleep(timeout)
+                logger.info("package: woke up")
+                continue
         with suppress(KeyError, IndexError):
             await uris_to_check_queue.put(package_data['urls'][0]['url'])
         for releases in package_data['releases'].values():
@@ -129,10 +143,10 @@ async def uri_checker(
         uri = await uris_to_check_queue.get()
         logger.debug("checker-%d: %r taken", number, uri)
         file_name = get_file_name_from_uri(uri)
-        file_path = str(get_file_path_from_file_name(file_name, paths))
-        if file_path in paths.known_paths:
+        if file_name in paths.known_file_names:
             logger.debug("checker-%d: %r already done", number, uri)
             continue
+        file_path = str(get_file_path_from_file_name(file_name, paths))
         await uris_to_download_queue.put((uri, file_path))
         logger.debug("checker-%d: %r done", number, uri)
 
@@ -142,7 +156,7 @@ async def uri_downloader(
         session: ClientSession,
         uris_to_download_queue: Queue,
         files_to_write_queue: Queue,
-        timeout: int = 15,
+        timeout: int = 60,
 ) -> None:
     while True:
         uri, file_path = await uris_to_download_queue.get()
@@ -158,7 +172,20 @@ async def uri_downloader(
                 await uris_to_download_queue.put((uri, file_path))
                 await asyncio.sleep(timeout)
                 continue
-            content_raw = await resp.read()
+            try:
+                content_raw = await resp.read()
+            except (asyncio.TimeoutError, ClientError) as err:
+                logger.error(
+                    "downloader-%d: %r %r. Sleeping for %d seconds.",
+                    number,
+                    uri,
+                    err,
+                    timeout,
+                )
+                await uris_to_download_queue.put((uri, file_path))
+                await asyncio.sleep(timeout)
+                logger.info("downloader-%d: woke up", number)
+                continue
         await files_to_write_queue.put((file_path, content_raw))
         logger.debug("downloader-%d: %r done", number, uri)
 
@@ -173,16 +200,16 @@ async def file_writer(
         file_path, content_raw = await files_to_write_queue.get()
         logger.debug("writer-%d: %r taken", number, file_path)
         try:
-            async with aioNamedTemporaryFile(delete=False) as fd:
-                await fd.write(content_raw)
-                await fd.flush()
-            await aiorename(fd.name, file_path)
+            with NamedTemporaryFile(delete=False) as fd:
+                fd.write(content_raw)
+                fd.flush()
+            rename(fd.name, file_path)
         except OSError as err:
             logger.exception("writer-%d: %r", number, err)
             await files_to_write_queue.put((file_path, content_raw))
             await asyncio.sleep(timeout)
             continue
-        paths.add_path(file_path)
+        paths.add_file_name(file_path)
         logger.debug("writer-%d: %r done", number, file_path)
 
 
@@ -197,19 +224,17 @@ async def queue_watcher(
         timeout: int = 5
 ) -> None:
     workers_message = (
-        f"Checkers: {checkers_count} "
-        f"Downlaoders: {downloaders_count} "
-        f"Writers: {writers_count}"
+        f"c:{checkers_count} d:{downloaders_count} w:{writers_count}"
     )
     while True:
         logger.info(
-            "names %d > tocheck %d > todownload %d > towrite %d",
+            "names %d > check %d > download %d > write %d (%s)",
             names_queue.qsize(),
             uris_to_check_queue.qsize(),
             uris_to_download_queue.qsize(),
             files_to_write_queue.qsize(),
+            workers_message,
         )
-        logger.info(workers_message)
         await asyncio.sleep(timeout)
 
 
@@ -218,19 +243,19 @@ async def main(
         download_streams_count: int,
         show_queue: bool,
 ) -> None:
-    checkers_count = 30  # should be enought
+    checkers_count = 100
     downloaders_count = download_streams_count
-    writers_count = 10  # check ulimit -n
-    paths.fill_known_paths()
+    writers_count = 1  # check "ulimit -n" for max file descriptos
+    paths.fill_known_file_names()
     logger.info(
-        "found %d files in %s",
-        len(paths.known_paths),
+        "Found %d files in %s",
+        len(paths.known_file_names),
         str(paths.base),
     )
-    names_queue: Queue = Queue(maxsize=10)
-    uris_to_check_queue: Queue = Queue()
-    uris_to_download_queue: Queue = Queue(maxsize=downloaders_count * 2)
-    files_to_write_queue: Queue = Queue(maxsize=writers_count * 3)
+    names_queue: Queue = Queue(maxsize=checkers_count)
+    uris_to_check_queue: Queue = Queue(maxsize=checkers_count)
+    uris_to_download_queue: Queue = Queue(maxsize=downloaders_count)
+    files_to_write_queue: Queue = Queue(maxsize=writers_count)
     async with ClientSession() as session:
         tasks = []
         tasks.append(names_fetcher(
@@ -293,7 +318,7 @@ def prepare() -> None:
     parser.add_argument(
         "--streams",
         type=int,
-        default=20,
+        default=4,
         metavar="N",
         help="Parallel streams count",
     )

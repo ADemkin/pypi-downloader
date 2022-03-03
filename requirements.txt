@@ -1,3 +1,1 @@
-aiofiles~=0.8
 aiohttp~=3.8
-types-aiofiles~=0.8
