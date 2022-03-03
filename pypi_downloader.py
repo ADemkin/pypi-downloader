@@ -12,7 +12,6 @@ import asyncio
 import logging
 import re
 
-from aiohttp import ClientError
 from aiohttp import ClientSession
 
 
@@ -176,7 +175,7 @@ async def uri_downloader(
                 continue
             try:
                 content_raw = await resp.read()
-            except (asyncio.TimeoutError, ClientError) as err:
+            except Exception as err:  # pylint: disable=broad-except
                 logger.error(
                     "downloader-%d: %r %r. Sleeping for %d seconds.",
                     number,
@@ -215,7 +214,7 @@ async def file_writer(
         logger.debug("writer-%d: %r done", number, file_path)
 
 
-async def queue_watcher(
+async def queue_watcher(  # pylint: disable=too-many-arguments
         names_queue: Queue,
         uris_to_check_queue: Queue,
         uris_to_download_queue: Queue,
