@@ -15,6 +15,7 @@ import re
 from aiohttp import ClientError
 from aiohttp import ClientSession
 
+
 PYPI_SIMPLE = "https://pypi.python.org/simple"
 PYPI_JSON_TEMPALTE = "https://pypi.python.org/pypi/{package_name}/json"
 
@@ -61,6 +62,7 @@ class Paths(NamedTuple):
         paths = Paths(Path(working_dir))
         for path in paths.iter_paths():
             makedirs(path, exist_ok=True)
+        paths.fill_known_file_names()
         return paths
 
 
@@ -245,8 +247,7 @@ async def main(
 ) -> None:
     checkers_count = 100
     downloaders_count = download_streams_count
-    writers_count = 1  # check "ulimit -n" for max file descriptos
-    paths.fill_known_file_names()
+    writers_count = 1  # check "ulimit -n" for max file descriptors
     logger.info(
         "Found %d files in %s",
         len(paths.known_file_names),
